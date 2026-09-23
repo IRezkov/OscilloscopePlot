@@ -6,7 +6,8 @@ import warnings
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                               QPushButton, QWidget, QFileDialog, QLabel, QSpinBox,
                               QMessageBox, QProgressDialog, QComboBox, QDialog,
-                              QFormLayout, QDoubleSpinBox, QDialogButtonBox, QCheckBox)
+                              QFormLayout, QDoubleSpinBox, QDialogButtonBox, QCheckBox,
+                              QSlider)
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor
 import pyqtgraph as pg
@@ -27,6 +28,64 @@ class CursorLine(pg.InfiniteLine):
     def on_position_change(self):
         if self.label:
             self.label.setText(f"{self.value():.6f}")
+
+
+class ScopeAxisItem(pg.AxisItem):
+    def __init__(self, orientation, channel_number, **kwargs):
+        super().__init__(orientation=orientation, **kwargs)
+        self.channel_number = channel_number
+        self.value_range = (0.0, 1.0)
+        self.zero_value = 0.0
+        self.zero_position = 0.5
+
+    def set_value_range(self, low, high, zero_value=0.0, zero_position=0.5):
+        self.value_range = (float(low), float(high))
+        self.zero_value = float(zero_value)
+        self.zero_position = float(zero_position)
+        self.picture = None
+        self.update()
+
+    def tickStrings(self, values, scale, spacing):
+        low, high = self.value_range
+        span = high - low
+        return [f"{self.zero_value + (value - self.zero_position) * span:.4g}" for value in values]
+
+    def wheelEvent(self, event):
+        """Do not let vertical-axis scrolling trigger pyqtgraph's default zoom."""
+        event.accept()
+
+
+class TimeAxisItem(pg.AxisItem):
+    """Show time ticks with explicit units and no scientific multiplier."""
+
+    def tickStrings(self, values, scale, spacing):
+        reference = max((abs(float(value)) for value in values if np.isfinite(value)), default=0.0)
+        if reference >= 1.0:
+            factor, unit = 1.0, 's'
+        elif reference >= 1e-3:
+            factor, unit = 1e3, 'ms'
+        elif reference >= 1e-6:
+            factor, unit = 1e6, 'us'
+        elif reference >= 1e-9:
+            factor, unit = 1e9, 'ns'
+        else:
+            factor, unit = 1e12, 'ps'
+        return [f"{float(value) * factor:.5g} {unit}" for value in values]
+
+
+class TimeZoomViewBox(pg.ViewBox):
+    """Keep mouse-wheel zoom limited to the shared time axis."""
+
+    def wheelEvent(self, event):
+        delta = event.delta()
+        if not delta:
+            event.accept()
+            return
+
+        factor = 0.8 if delta > 0 else 1.25
+        center = self.mapSceneToView(event.scenePos())
+        self.scaleBy((factor, 1.0), center=center)
+        event.accept()
 
 class BinaryImportDialog(QDialog):
     """Dialog to configure binary import settings."""
@@ -447,8 +506,12 @@ class OscilloscopeViewer(QMainWindow):
         self.metadata = {}
         self.raw_data = None  # Store complete dataset
         self.decimation_factor = 10000  # Default decimation points
-        self.dark_mode = False  # Track dark mode state
+        self.dark_mode = True  # Track dark mode state
         self.selected_channel: int | None = None  # Active channel (e.g., 1..4) if available
+        self.display_mode = 'HI/LO'
+        self.channel_view_ranges = {}
+        self.channel_zero_positions = {1: 0.5, 2: 0.5}
+        self.channel_zero_values = {1: 0.0, 2: 0.0}
         
         # Define color schemes
         self.color_schemes = {
@@ -457,12 +520,14 @@ class OscilloscopeViewer(QMainWindow):
                 'foreground': 'k',
                 'grid': (128, 128, 128),
                 'plot': 'b',
+                'channel_plots': ['#2166f3', '#e6b800'],
             },
             'dark': {
                 'background': '#2b2b2b',
                 'foreground': 'w',
                 'grid': (90, 90, 90),
                 'plot': '#00a3ff',
+                'channel_plots': ['#4d8dff', '#ffd34d'],
             }
         }
         
@@ -475,11 +540,23 @@ class OscilloscopeViewer(QMainWindow):
         layout = QVBoxLayout(central_widget)
         
         # Create plot widget
-        self.plot_widget = pg.PlotWidget()
-        self.plot_widget.setBackground('w')
+        left_axis = ScopeAxisItem(orientation='left', channel_number=1)
+        right_axis = ScopeAxisItem(orientation='right', channel_number=2)
+        bottom_axis = TimeAxisItem(orientation='bottom')
+        self.plot_widget = pg.PlotWidget(
+            axisItems={'left': left_axis, 'right': right_axis, 'bottom': bottom_axis},
+            viewBox=TimeZoomViewBox(),
+        )
+        initial_colors = self.color_schemes['dark' if self.dark_mode else 'light']
+        self.plot_widget.setBackground(initial_colors['background'])
         self.plot_widget.showGrid(x=True, y=True)
-        self.plot_widget.setLabel('left', 'Voltage (V)')
+        self.plot_widget.setLabel('left', 'CH1 Voltage (V)')
+        self.plot_widget.showAxis('right')
+        self.plot_widget.setLabel('right', 'CH2 Voltage (V)')
         self.plot_widget.setLabel('bottom', 'Time (s)')
+        self.secondary_view = pg.ViewBox()
+        self.secondary_view.setMouseEnabled(x=False, y=False)
+        self.plot_widget.getAxis('right').linkToView(self.plot_widget.getViewBox())
         
         # Enable antialiasing for smoother lines
         self.plot_widget.setAntialiasing(True)
@@ -510,6 +587,31 @@ class OscilloscopeViewer(QMainWindow):
         clear_cursors_button = QPushButton("Clear Cursors")
         clear_cursors_button.clicked.connect(self.clear_cursors)
         button_layout.addWidget(clear_cursors_button)
+
+        zoom_in_button = QPushButton("Zoom +")
+        zoom_in_button.clicked.connect(self.zoom_in)
+        button_layout.addWidget(zoom_in_button)
+
+        zoom_out_button = QPushButton("Zoom -")
+        zoom_out_button.clicked.connect(self.zoom_out)
+        button_layout.addWidget(zoom_out_button)
+
+        reset_zoom_button = QPushButton("Reset zoom")
+        reset_zoom_button.clicked.connect(self.reset_zoom)
+        button_layout.addWidget(reset_zoom_button)
+
+        ch1_zoom_out = QPushButton("CH1 -")
+        ch1_zoom_out.clicked.connect(lambda: self.zoom_y(1, 1.25))
+        button_layout.addWidget(ch1_zoom_out)
+        ch1_zoom_in = QPushButton("CH1 +")
+        ch1_zoom_in.clicked.connect(lambda: self.zoom_y(1, 0.8))
+        button_layout.addWidget(ch1_zoom_in)
+        ch2_zoom_out = QPushButton("CH2 -")
+        ch2_zoom_out.clicked.connect(lambda: self.zoom_y(2, 1.25))
+        button_layout.addWidget(ch2_zoom_out)
+        ch2_zoom_in = QPushButton("CH2 +")
+        ch2_zoom_in.clicked.connect(lambda: self.zoom_y(2, 0.8))
+        button_layout.addWidget(ch2_zoom_in)
         
         # Add dark mode toggle
         toggle_dark_mode = QPushButton("Toggle Dark Mode")
@@ -527,14 +629,28 @@ class OscilloscopeViewer(QMainWindow):
         decimation_layout.addWidget(self.decimation_spinbox)
         button_layout.addLayout(decimation_layout)
 
-        # Channel selector (populated when file contains multiple channels)
-        channel_layout = QHBoxLayout()
-        channel_layout.addWidget(QLabel("Channel:"))
-        self.channel_combo = QComboBox()
-        self.channel_combo.setEnabled(False)
-        self.channel_combo.currentTextChanged.connect(self.on_channel_changed)
-        channel_layout.addWidget(self.channel_combo)
-        button_layout.addLayout(channel_layout)
+        zero_layout = QHBoxLayout()
+        zero_layout.addWidget(QLabel("CH1 Zero"))
+        self.ch1_zero_slider = QSlider(Qt.Horizontal)
+        self.ch1_zero_slider.setRange(0, 100)
+        self.ch1_zero_slider.setValue(50)
+        self.ch1_zero_slider.valueChanged.connect(lambda value: self.set_zero_position(1, value))
+        zero_layout.addWidget(self.ch1_zero_slider)
+        zero_layout.addWidget(QLabel("CH2 Zero"))
+        self.ch2_zero_slider = QSlider(Qt.Horizontal)
+        self.ch2_zero_slider.setRange(0, 100)
+        self.ch2_zero_slider.setValue(50)
+        self.ch2_zero_slider.valueChanged.connect(lambda value: self.set_zero_position(2, value))
+        zero_layout.addWidget(self.ch2_zero_slider)
+        layout.addLayout(zero_layout)
+
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Display mode:"))
+        self.display_mode_combo = QComboBox()
+        self.display_mode_combo.addItems(["HI/LO", "MEAN"])
+        self.display_mode_combo.currentTextChanged.connect(self.on_display_mode_changed)
+        mode_layout.addWidget(self.display_mode_combo)
+        button_layout.addLayout(mode_layout)
         
         layout.addLayout(button_layout)
         
@@ -559,10 +675,12 @@ class OscilloscopeViewer(QMainWindow):
         layout.addLayout(measurement_layout)
         
         # Style the plot
-        self.plot_widget.getAxis('left').setPen('k')
-        self.plot_widget.getAxis('bottom').setPen('k')
-        self.plot_widget.getAxis('left').setTextPen('k')
-        self.plot_widget.getAxis('bottom').setTextPen('k')
+        self.plot_widget.getAxis('left').setPen(initial_colors['channel_plots'][0])
+        self.plot_widget.getAxis('bottom').setPen(initial_colors['foreground'])
+        self.plot_widget.getAxis('left').setTextPen(initial_colors['channel_plots'][0])
+        self.plot_widget.getAxis('bottom').setTextPen(initial_colors['foreground'])
+        self.plot_widget.getAxis('right').setPen(initial_colors['channel_plots'][1])
+        self.plot_widget.getAxis('right').setTextPen(initial_colors['channel_plots'][1])
         
         # Connect viewbox signals for dynamic decimation
         self.plot_widget.getViewBox().sigRangeChanged.connect(self.on_view_changed)
@@ -611,6 +729,10 @@ class OscilloscopeViewer(QMainWindow):
             try:
                 # Parse the file with progress reporting
                 self.metadata, self.raw_data = parser.parse(file_name, update_progress)
+                self.channel_view_ranges.clear()
+                self.channel_zero_positions = {1: 0.5, 2: 0.5}
+                self.ch1_zero_slider.setValue(50)
+                self.ch2_zero_slider.setValue(50)
                 
                 # Update data info label
                 self.data_info_label.setText(
@@ -618,7 +740,10 @@ class OscilloscopeViewer(QMainWindow):
                     f"Displayed points: {self.decimation_factor:,}"
                 )
                 
-                # Populate channel selector if available
+                # Reset display mode for the newly loaded signal.
+                self.display_mode = 'HI/LO'
+                self.display_mode_combo.setCurrentText('HI/LO')
+                """
                 channels = self.metadata.get('Channels')
                 self.channel_combo.blockSignals(True)
                 self.channel_combo.clear()
@@ -641,9 +766,12 @@ class OscilloscopeViewer(QMainWindow):
                     self.channel_combo.setEnabled(False)
                     self.selected_channel = None
                 self.channel_combo.blockSignals(False)
+                """
 
                 # Plot decimated data
                 self.update_plot()
+                self.auto_fit_time_range()
+                self.auto_fit_voltage_range()
                 
             except InterruptedError:
                 self.data_info_label.setText("Loading cancelled")
@@ -835,6 +963,10 @@ class OscilloscopeViewer(QMainWindow):
                 metadata['Channels'] = list(range(1, ch_count + 1))
 
             self.metadata, self.raw_data = metadata, df
+            self.channel_view_ranges.clear()
+            self.channel_zero_positions = {1: 0.5, 2: 0.5}
+            self.ch1_zero_slider.setValue(50)
+            self.ch2_zero_slider.setValue(50)
 
             # Update UI similarly to CSV load
             self.data_info_label.setText(
@@ -842,7 +974,10 @@ class OscilloscopeViewer(QMainWindow):
                 f"Displayed points: {self.decimation_factor:,}"
             )
 
-            # Populate channel selector if available
+            # Reset display mode for the newly loaded signal.
+            self.display_mode = 'HI/LO'
+            self.display_mode_combo.setCurrentText('HI/LO')
+            """
             channels = self.metadata.get('Channels')
             self.channel_combo.blockSignals(True)
             self.channel_combo.clear()
@@ -865,8 +1000,11 @@ class OscilloscopeViewer(QMainWindow):
                 self.channel_combo.setEnabled(False)
                 self.selected_channel = None
             self.channel_combo.blockSignals(False)
+            """
 
             self.update_plot()
+            self.auto_fit_time_range()
+            self.auto_fit_voltage_range()
 
             progress.setValue(100)
             progress.setLabelText("Done!")
@@ -885,35 +1023,78 @@ class OscilloscopeViewer(QMainWindow):
         self.decimation_factor = value
         if self.raw_data is not None:
             self.update_plot()
+
+    def auto_fit_time_range(self):
+        """Fit the shared horizontal axis to the newly loaded signal."""
+        if self.raw_data is None or 'Second' not in self.raw_data.columns:
+            return
+        time_values = pd.to_numeric(self.raw_data['Second'], errors='coerce').to_numpy(dtype=float)
+        time_values = time_values[np.isfinite(time_values)]
+        if time_values.size == 0:
+            return
+        time_min = float(time_values.min())
+        time_max = float(time_values.max())
+        if time_min == time_max:
+            margin = max(abs(time_min) * 0.05, 1e-9)
+            time_min -= margin
+            time_max += margin
+        self.plot_widget.getViewBox().setXRange(time_min, time_max, padding=0.02)
+
+    def auto_fit_voltage_range(self):
+        """Fit the shared normalized vertical grid to all loaded channels."""
+        if self.raw_data is None:
+            return
+
+        display_values = []
+        channel_columns = sorted(
+            column for column in self.raw_data.columns
+            if column.startswith('Value_CH') and column.endswith('_Low')
+        )
+        for low_column in channel_columns:
+            channel_number = int(low_column[len('Value_CH'):-len('_Low')])
+            high_column = f'Value_CH{channel_number}_High'
+            if high_column not in self.raw_data.columns:
+                continue
+            self._ensure_channel_range(channel_number, low_column, high_column)
+            display_values.extend((
+                self._to_display_range(self.raw_data[low_column].to_numpy(), channel_number),
+                self._to_display_range(self.raw_data[high_column].to_numpy(), channel_number),
+            ))
+
+        if not display_values:
+            for channel_number in (1, 2):
+                value_column = f'Value_CH{channel_number}'
+                if value_column not in self.raw_data.columns:
+                    continue
+                self._ensure_channel_range(channel_number, value_column, value_column)
+                display_values.append(
+                    self._to_display_range(self.raw_data[value_column].to_numpy(), channel_number)
+                )
+
+        finite_values = np.concatenate([values[np.isfinite(values)] for values in display_values]) if display_values else np.array([])
+        if finite_values.size == 0:
+            return
+        y_min = float(finite_values.min())
+        y_max = float(finite_values.max())
+        if y_min == y_max:
+            margin = max(abs(y_min) * 0.05, 0.05)
+            y_min -= margin
+            y_max += margin
+        self.plot_widget.getViewBox().setYRange(y_min, y_max, padding=0.05)
             
     def update_plot(self):
         if self.raw_data is None:
             return
         
-        # Determine which value column to display
-        y_col = None
-        if self.selected_channel is not None:
-            candidate = f"Value_CH{self.selected_channel}"
-            if candidate in self.raw_data.columns:
-                y_col = candidate
-        if y_col is None:
-            # Fallback to default 'Value' if present
-            if 'Value' in self.raw_data.columns:
-                y_col = 'Value'
-            else:
-                # Last resort: pick the first Value_CHn column
-                ch_cols = [c for c in self.raw_data.columns if c.startswith('Value_CH')]
-                if ch_cols:
-                    y_col = ch_cols[0]
-        if y_col is None:
-            return
-
-        # Decimate data for selected column
-        x_dec, y_dec = decimate_data(
-            self.raw_data['Second'].values,
-            self.raw_data[y_col].values,
-            max_points=self.decimation_factor
+        channel_numbers = sorted(
+            int(column.removeprefix('Value_CH'))
+            for column in self.raw_data.columns
+            if column.startswith('Value_CH') and column.removeprefix('Value_CH').isdigit()
         )
+        if not channel_numbers and 'Value' in self.raw_data.columns:
+            channel_numbers = [None]
+        if not channel_numbers:
+            return
         
         # Get current color scheme
         mode = 'dark' if self.dark_mode else 'light'
@@ -921,8 +1102,70 @@ class OscilloscopeViewer(QMainWindow):
         
         # Update plot
         self.plot_widget.clear()
-        self.plot_widget.plot(x_dec, y_dec, pen=pg.mkPen(colors['plot'], width=2))
-        
+        displayed_points = 0
+        for channel_index, channel_number in enumerate(channel_numbers):
+            y_col = 'Value' if channel_number is None else f'Value_CH{channel_number}'
+            axis_channel = 1 if channel_number is None else channel_number
+            channel_color = colors['channel_plots'][channel_index] if channel_index < len(colors['channel_plots']) else colors['plot']
+            low_col = f"{y_col}_Low"
+            high_col = f"{y_col}_High"
+            if low_col in self.raw_data.columns and high_col in self.raw_data.columns:
+                x_low, raw_low = decimate_data(
+                    self.raw_data['Second'].values,
+                    self.raw_data[low_col].values,
+                    max_points=self.decimation_factor,
+                )
+                x_high, raw_high = decimate_data(
+                    self.raw_data['Second'].values,
+                    self.raw_data[high_col].values,
+                    max_points=self.decimation_factor,
+                )
+                target_view = self.plot_widget
+                self._ensure_channel_range(axis_channel, low_col, high_col)
+                y_low = self._to_display_range(raw_low, axis_channel)
+                y_high = self._to_display_range(raw_high, axis_channel)
+                mean_column = f"{y_col}"
+                x_mean, raw_mean = decimate_data(
+                    self.raw_data['Second'].values,
+                    self.raw_data[mean_column].values,
+                    max_points=self.decimation_factor,
+                )
+                y_mean = self._to_display_range(raw_mean, axis_channel)
+                mean_curve = pg.PlotDataItem(
+                    x=x_mean,
+                    y=y_mean,
+                    pen=pg.mkPen(channel_color, width=3),
+                )
+                target_view.addItem(mean_curve)
+                if self.display_mode == 'HI/LO':
+                    invisible_pen = pg.mkPen(color=channel_color, width=1)
+                    invisible_pen.setColor(pg.mkColor(0, 0, 0, 0))
+                    lower_curve = pg.PlotDataItem(x=x_low, y=y_low, pen=invisible_pen)
+                    upper_curve = pg.PlotDataItem(x=x_high, y=y_high, pen=invisible_pen)
+                    fill_color = pg.mkColor(channel_color)
+                    fill_color.setAlpha(150)
+                    target_view.addItem(lower_curve)
+                    target_view.addItem(upper_curve)
+                    target_view.addItem(
+                        pg.FillBetweenItem(lower_curve, upper_curve, brush=pg.mkBrush(fill_color))
+                    )
+                displayed_points = max(displayed_points, len(x_mean))
+            else:
+                x_dec, raw_values = decimate_data(
+                    self.raw_data['Second'].values,
+                    self.raw_data[y_col].values,
+                    max_points=self.decimation_factor,
+                )
+                target_view = self.plot_widget
+                self._ensure_channel_range(axis_channel, y_col, y_col)
+                y_dec = self._to_display_range(raw_values, axis_channel)
+                target_view.addItem(
+                    pg.PlotDataItem(x=x_dec, y=y_dec, pen=pg.mkPen(channel_color, width=2))
+                )
+                displayed_points = max(displayed_points, len(x_dec))
+
+        self._update_axis_ranges()
+
         # Restore cursors
         for cursor in self.vertical_cursors + self.horizontal_cursors:
             self.plot_widget.addItem(cursor)
@@ -930,14 +1173,52 @@ class OscilloscopeViewer(QMainWindow):
         # Update axis labels with units from metadata
         x_unit = self.metadata.get('Horizontal Units', ['s'])[0]
         y_unit = self.metadata.get('Vertical Units', ['V'])[0]
-        self.plot_widget.setLabel('left', f'Voltage ({y_unit})')
+        self.plot_widget.setLabel('left', f'CH1 Voltage ({y_unit})')
+        self.plot_widget.setLabel('right', f'CH2 Voltage ({y_unit})')
         self.plot_widget.setLabel('bottom', f'Time ({x_unit})')
         
         # Update data info label
         self.data_info_label.setText(
             f"Total points: {len(self.raw_data):,}\n"
-            f"Displayed points: {len(x_dec):,}"
+            f"Displayed points: {displayed_points:,}"
         )
+
+    def _ensure_channel_range(self, channel_number, low_column, high_column):
+        if channel_number in self.channel_view_ranges:
+            return
+        values = pd.concat((self.raw_data[low_column], self.raw_data[high_column]))
+        low = float(values.min())
+        high = float(values.max())
+        low = min(low, self.channel_zero_values.get(channel_number, 0.0))
+        high = max(high, self.channel_zero_values.get(channel_number, 0.0))
+        if not np.isfinite(low) or not np.isfinite(high):
+            low, high = 0.0, 1.0
+        if low == high:
+            margin = max(abs(low) * 0.05, 1.0)
+            low -= margin
+            high += margin
+        self.channel_view_ranges[channel_number] = (low, high)
+
+    def _to_display_range(self, values, channel_number):
+        low, high = self.channel_view_ranges[channel_number]
+        zero_value = self.channel_zero_values.get(channel_number, 0.0)
+        zero_position = self.channel_zero_positions.get(channel_number, 0.5)
+        return zero_position + (np.asarray(values, dtype=float) - zero_value) / (high - low)
+
+    def _update_axis_ranges(self):
+        left_axis = self.plot_widget.getAxis('left')
+        right_axis = self.plot_widget.getAxis('right')
+        left_axis.set_value_range(
+            *self.channel_view_ranges.get(1, (0.0, 1.0)),
+            self.channel_zero_values.get(1, 0.0),
+            self.channel_zero_positions.get(1, 0.5),
+        )
+        right_axis.set_value_range(
+            *self.channel_view_ranges.get(2, (0.0, 1.0)),
+            self.channel_zero_values.get(2, 0.0),
+            self.channel_zero_positions.get(2, 0.5),
+        )
+        self.plot_widget.getViewBox().setYRange(0.0, 1.0, padding=0.0)
 
     def on_channel_changed(self, text: str):
         # Parse channel like "CH1" to integer 1
@@ -952,11 +1233,49 @@ class OscilloscopeViewer(QMainWindow):
         # Re-plot with the selected channel
         if self.raw_data is not None:
             self.update_plot()
+
+    def on_display_mode_changed(self, mode: str):
+        self.display_mode = mode
+        if self.raw_data is not None:
+            self.update_plot()
         
     def on_view_changed(self, view_box, range_):
         """Called when the view range changes (zoom/pan)"""
+        return
+
+    def _update_secondary_view(self):
+        pass
+
+    def zoom_in(self):
+        self.plot_widget.getViewBox().scaleBy((0.7, 1.0))
+
+    def zoom_out(self):
+        self.plot_widget.getViewBox().scaleBy((1.4, 1.0))
+
+    def zoom_y(self, channel_number: int, factor: float):
+        """Change only the physical vertical scale belonging to one channel."""
+        if channel_number not in self.channel_view_ranges:
+            return
+        low, high = self.channel_view_ranges[channel_number]
+        center = self.channel_zero_values.get(channel_number, 0.0)
+        half_span = (high - low) * factor / 2.0
+        self.channel_view_ranges[channel_number] = (center - half_span, center + half_span)
+        self.update_plot()
+
+    def set_zero_position(self, channel_number: int, slider_value: int):
+        """Move one channel's zero line inside the shared normalized grid."""
+        self.channel_zero_positions[channel_number] = max(0.0, min(1.0, slider_value / 100.0))
         if self.raw_data is not None:
             self.update_plot()
+
+    def reset_zoom(self):
+        self.channel_view_ranges.clear()
+        self.channel_zero_positions = {1: 0.5, 2: 0.5}
+        self.ch1_zero_slider.setValue(50)
+        self.ch2_zero_slider.setValue(50)
+        self.update_plot()
+        self.auto_fit_time_range()
+        self.auto_fit_voltage_range()
             
     def add_vertical_cursor(self):
         if len(self.vertical_cursors) >= 2:
@@ -1032,10 +1351,12 @@ class OscilloscopeViewer(QMainWindow):
         
         # Update plot colors
         self.plot_widget.setBackground(colors['background'])
-        self.plot_widget.getAxis('left').setPen(colors['foreground'])
+        self.plot_widget.getAxis('left').setPen(colors['channel_plots'][0])
         self.plot_widget.getAxis('bottom').setPen(colors['foreground'])
-        self.plot_widget.getAxis('left').setTextPen(colors['foreground'])
+        self.plot_widget.getAxis('left').setTextPen(colors['channel_plots'][0])
         self.plot_widget.getAxis('bottom').setTextPen(colors['foreground'])
+        self.plot_widget.getAxis('right').setPen(colors['channel_plots'][1])
+        self.plot_widget.getAxis('right').setTextPen(colors['channel_plots'][1])
         
         # Update grid color
         self.plot_widget.getPlotItem().getViewBox().setBackgroundColor(colors['background'])
