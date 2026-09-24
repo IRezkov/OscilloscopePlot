@@ -21,6 +21,25 @@ A Python-based desktop application for visualizing and analyzing oscilloscope wa
 
 ## Installation
 
+### Quick install on Windows
+
+Run PowerShell from the project folder:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\install.ps1
+```
+
+The installer creates a private environment in `%LOCALAPPDATA%\OscilloscopeViewer`, installs dependencies, creates Start Menu and Desktop shortcuts, and adds **Open in Oscilloscope Viewer** to the CSV context menu. Python 3.10+ must be installed and available as `python.exe`.
+
+To install to another directory:
+
+```powershell
+.\install.ps1 -InstallDir 'D:\Apps\OscilloscopeViewer'
+```
+
+### Manual installation
+
 1. Create a virtual environment (recommended):
 ```bash
 python -m venv venv
@@ -39,12 +58,30 @@ pip install -r requirements.txt
 python oscilloscope_viewer.py
 ```
 
+You can open a CSV directly from PowerShell:
+
+```powershell
+python oscilloscope_viewer.py 'C:\path\to\DATA001.CSV'
+```
+
+After installation, use the Desktop shortcut or right-click a `.csv` file and choose **Открыть в Oscilloscope Viewer**.
+
 2. Use the interface:
    - Click "Load CSV" to open your oscilloscope data file
    - Add cursors using the buttons
    - Drag cursors by hovering over them (cursor will change to indicate movability)
    - Adjust the "Max Points" value to balance between performance and detail
    - Use mouse wheel to zoom and right-click drag to pan
+
+## Windows EXE (optional)
+
+Building an EXE is optional and can take several minutes. In PowerShell, run from the project folder:
+
+```powershell
+.\build_exe.ps1
+```
+
+The executable will be created at `dist\OscilloscopeViewer.exe`.
 
 ## Supported File Formats
 

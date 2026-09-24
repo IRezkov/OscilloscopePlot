@@ -685,10 +685,11 @@ class OscilloscopeViewer(QMainWindow):
         # Connect viewbox signals for dynamic decimation
         self.plot_widget.getViewBox().sigRangeChanged.connect(self.on_view_changed)
         
-    def load_csv(self):
-        file_name, _ = QFileDialog.getOpenFileName(
-            self, "Open CSV File", "", "CSV Files (*.csv);;All Files (*)"
-        )
+    def load_csv(self, file_name: str | None = None):
+        if not file_name:
+            file_name, _ = QFileDialog.getOpenFileName(
+                self, "Open CSV File", "", "CSV Files (*.csv);;All Files (*)"
+            )
         
         if file_name:
             # Get file size for progress calculation
@@ -1370,6 +1371,10 @@ def main():
     
     viewer = OscilloscopeViewer()
     viewer.show()
+    if len(sys.argv) > 1:
+        file_name = Path(sys.argv[1]).resolve()
+        if file_name.is_file():
+            viewer.load_csv(str(file_name))
     sys.exit(app.exec())
 
 if __name__ == '__main__':
